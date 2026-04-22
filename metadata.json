@@ -1,0 +1,8 @@
+{
+  "name": "Jarvis AI 2",
+  "description": "A fully voice-driven AI desktop assistant that you can talk to naturally. Switch between real conversations and executing tasks.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
