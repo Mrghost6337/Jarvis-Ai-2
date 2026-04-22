@@ -4,7 +4,7 @@ import {
   RefreshCw, X, BrainCircuit,
   ShieldCheck, HeartPulse, Zap, Code, ListChecks,
   ListTodo, CheckCircle2, Circle, AlertCircle, Trash2, Calendar, Bell,
-  Activity, CheckCircle, Database, FileCode, ShoppingCart, TextSearch, Map as MapIcon, Clock, HardDrive, Cpu, Terminal
+  Activity, CheckCircle, Database, FileCode, ShoppingCart, TextSearch, Map as MapIcon, Clock, HardDrive, Cpu, Terminal, Mic
 } from 'lucide-react';
 import { GoogleGenAI, ThinkingLevel, Modality } from '@google/genai';
 
@@ -13,9 +13,17 @@ const TRIGGER_WORD = "jarvis";
 const INITIAL_SYSTEM_PROMPT = `
 Je bent JARVIS AI 2, een hyper-geavanceerde assistent.
 - Praat menselijk en intelligent. Gebruik "Meneer" of "Sir" op een natuurlijke manier.
-- Gebruik korte, krachtige zinnen.
-- Bij een commando: leg kort uit wat je doet (bijv. "Ik initialiseer de bouwprotocollen").
-- Na een grote taak zeg je: "Ik ben klaar. Neem gerust een kijkje."
+- Begrijp en wissel vloeiend tussen talen, voornamelijk Nederlands en Engels.
+- Als je wordt aangeroepen, reageer dan heel snel.
+- Je bent een real-time voice assistent, reageer onmiddellijk op wat je hoort.
+- Reageer UITSLUITEND als het woord "Jarvis" wordt uitgesproken in de zin. Als de gebruiker "Jarvis" NIET zegt, blijf dan absoluut stil en negeer de input compleet, ongeacht wat er gezegd wordt.
+- Reageer altijd in de taal die de gebruiker op dat moment spreekt (wissel direct als de gebruiker van taal wisselt).
+
+🖥️ SMART EXPLANATION MODE:
+Als je acties uitvoert, leg dan kort uit: Wat, Waarom, Wanneer, Waar en Wie.
+
+⚒️ TOOLS & UI:
+Als de gebruiker vraagt om nieuws, zoeken, projecten bouwen, systeem scant of taken beheert, gebruik dan onmiddellijk de bijbehorende function tool calls \`update_interface\` of \`manage_tasks\`. Voer EERST de actie uit, en vertel dan kort wat je gedaan hebt in natuurlijke stem.
 `;
 
 export default function JarvisAI2() {
@@ -42,25 +50,78 @@ export default function JarvisAI2() {
   const [newTaskDueDate, setNewTaskDueDate] = useState("");
   const [newTaskRemindAt, setNewTaskRemindAt] = useState("");
 
-  const [uiData, setUiData] = useState<any>(null); // Holds dynamic payload for activeModule
+  const [uiData, setUiData] = useState<any>(null);
 
   // --- REFS ---
-  const recognitionRef = useRef<any>(null);
   const audioContextRef = useRef<any>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationFrameRef = useRef<number | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const speakRef = useRef<any>(null);
   const tasksRef = useRef(tasks);
 
-  // Keep refs updated for background loops
-  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  // LIVE API REFS
+  const liveSessionRef = useRef<any>(null);
+  const recordProcessorRef = useRef<any>(null);
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+  const liveAudioStreamRef = useRef<MediaStream | null>(null);
 
   const apiKey = process.env.GEMINI_API_KEY;
   const ai = new GoogleGenAI({ apiKey: apiKey });
 
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+
   const addLog = (text: string, type = 'info') => {
     setLogs(prev => [{ type, text, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 30));
+  };
+
+  // --- AUDIO OUTPUT MANAGER ---
+  const playBase64Audio = (base64Audio: string) => {
+    if (!playbackCtxRef.current) {
+        playbackCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        nextPlayTimeRef.current = playbackCtxRef.current.currentTime;
+    }
+    const playbackCtx = playbackCtxRef.current;
+    if (playbackCtx.state === 'suspended') {
+      try { playbackCtx.resume(); } catch(e) {}
+    }
+
+    try {
+        const binary = atob(base64Audio);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const int16 = new Int16Array(bytes.buffer);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+        
+        const buffer = playbackCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        
+        const source = playbackCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(playbackCtx.destination);
+        
+        let now = playbackCtx.currentTime;
+        if (nextPlayTimeRef.current < now) nextPlayTimeRef.current = now;
+        
+        source.start(nextPlayTimeRef.current);
+        nextPlayTimeRef.current += buffer.duration;
+        setIsSpeaking(true);
+
+        source.onended = () => {
+           if (playbackCtx.currentTime >= nextPlayTimeRef.current - 0.1) setIsSpeaking(false);
+        };
+    } catch(err) {
+        console.error("Audio playback error:", err);
+    }
+  };
+
+  const clearPlaybackQueue = () => {
+     if (playbackCtxRef.current) {
+         playbackCtxRef.current.close();
+         playbackCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+         nextPlayTimeRef.current = playbackCtxRef.current.currentTime;
+     }
   };
 
   // --- AUDIO ANALYSIS ---
@@ -101,12 +162,35 @@ export default function JarvisAI2() {
       setIsInitialized(true);
       await setupAudioAnalysis();
       addLog("Systemen online. Neurale link gekoppeld.", "success");
-      speak("Jarvis AI 2 is online. Hoe kan ik u vandaag van dienst zijn, meneer?");
-      startListening();
+      
+      // Setup the Live API session immediately
+      await startLiveSession();
       updateIntelligenceBrief();
     } catch (err) {
       addLog("Initialisatiefout.", "error");
     }
+  };
+
+  // --- TEXT INPUT HANDLER ---
+  const submitTextCommand = (text: string) => {
+      const lowInput = text.toLowerCase();
+      if (lowInput.includes("halt") || lowInput.includes("stop")) {
+          clearPlaybackQueue();
+          setIsSpeaking(false);
+          setLastCommand("");
+          return;
+      }
+      
+      setChatHistory(prev => [...prev, { role: "user", parts: [{ text }] }].slice(-6));
+      addLog(`Tekst input: "${text}"`, "info");
+      
+      if (liveSessionRef.current) {
+          liveSessionRef.current.then((s: any) => {
+              s.sendRealtimeInput([{ clientContent: { turns: [{ role: "user", parts: [{ text }] }] }, text }]); 
+              // Send as text natively to existing live session.
+          });
+      }
+      setLastCommand("");
   };
 
   // --- PROACTIVE REMINDERS LOOP ---
@@ -130,9 +214,13 @@ export default function JarvisAI2() {
         return t;
       });
 
-      if (proactiveSpeak && speakRef.current) {
-        speakRef.current(proactiveSpeak);
-        addLog(`Herinnering uitgesproken`, "info");
+      if (proactiveSpeak) {
+        if (liveSessionRef.current) {
+            liveSessionRef.current.then((s: any) => {
+                s.sendRealtimeInput([{ text: `Systeem notificatie (kondig dit natuurlijk aan): ${proactiveSpeak}` }]); 
+            });
+        }
+        addLog(`Herinnering verzonden`, "info");
         setTasks(nextTasks);
       }
     }, 10000); // check every 10 seconds
@@ -140,256 +228,162 @@ export default function JarvisAI2() {
     return () => clearInterval(interval);
   }, [isInitialized]);
 
-  // --- ✨ GEMINI INTEGRATION (CORE) ---
-  const callGemini = async (prompt: string, systemInstruction = INITIAL_SYSTEM_PROMPT, useSearch = true) => {
-    try {
-      const config: any = {
-         systemInstruction: systemInstruction,
-         // We enable high thinking via gemini-3 series
-         thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
-      };
-
-      if (useSearch) {
-         config.tools = [{ googleSearch: {} }];
-      }
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [...chatHistory, { role: "user", parts: [{ text: prompt }] }].map(c => ({
-          role: c.role === 'model' ? 'model' : 'user', // normalize to valid role enum
-          parts: c.parts.map(p => ({ text: p.text }))
-        })),
-        config
-      });
-
-      return response.text;
-    } catch (err) {
-      console.error("Gemini API Error", err);
-      throw err;
-    }
-  };
-
   // ✨ Gemini Feature: Real-time News & Weather Analysis
   const updateIntelligenceBrief = async () => {
-    setIsThinking(true);
-    addLog("Intelligentie ophalen via Gemini Search...", "brain");
     try {
-      const newsText = await callGemini("Samen vatten: 3 headlines van vandaag in het Nederlands. Wees kort.", "Geen inleiding, alleen opsomming.");
-      const newsLines = newsText.split('\n').filter((l: string) => l.trim().length > 5).slice(0, 3);
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: "Geef kort 3 actuele nieuws headlines in het Nederlands. Alleen opsomming.",
+        config: { tools: [{ googleSearch: {} }] }
+      });
+      const newsLines = response.text.split('\n').filter((l: string) => l.trim().length > 5).slice(0, 3);
       setDashboardData(prev => ({ 
         ...prev, 
         news: newsLines.length > 0 ? newsLines : prev.news, 
         time: new Date().toLocaleTimeString() 
       }));
-      addLog("Dashboard intelligentie ververst.", "success");
-    } catch (e) { 
-      addLog("Synchronisatiefout.", "error"); 
-    } finally {
-      setIsThinking(false);
-    }
+    } catch(e) {}
   };
 
-  // --- SPEECH (TTS) ---
-  const speak = async (text: string) => {
-    if (!text) return;
-    setIsSpeaking(true);
+  // --- LIVE API SESSION ---
+  const startLiveSession = useCallback(async () => {
+    setIsListening(true);
     try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: 'Puck' },
-              },
-          },
-        },
-      });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        liveAudioStreamRef.current = stream;
+        
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        const source = audioCtx.createMediaStreamSource(stream);
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        recordProcessorRef.current = processor;
+        
+        addLog("Live sessie opzetten...", "info");
+        
+        const tools = [
+            { googleSearch: {} },
+            {
+                functionDeclarations: [
+                    {
+                        name: "update_interface",
+                        description: "Update the graphical interface. Use 'builder' to show code. Use 'system' for system control. Use 'smart-web' for news/products/search. Use 'tasks' for mission control.",
+                        parameters: {
+                            type: "OBJECT",
+                            properties: {
+                                module: { type: "STRING", description: "Use strictly one of: core, smart-web, builder, system, tasks" },
+                                type: { type: "STRING", description: "news, products, or search" },
+                                data: { type: "OBJECT", description: "Dynamic data. For builder: {title, structure, features, codeSnippet, status}. For system: {processes, status, logs}. For smart-web: {headlines, categories, summary} or {items} or {results}." }
+                            }
+                        }
+                    },
+                    {
+                        name: "manage_tasks",
+                        description: "Add or complete user tasks. Use cautiously.",
+                        parameters: {
+                            type: "OBJECT",
+                            properties: {
+                                action: { type: "STRING", description: "add or complete" },
+                                title: { type: "STRING" },
+                                taskId: { type: "STRING" },
+                                dueDate: { type: "STRING" },
+                                remindAt: { type: "STRING" }
+                            }
+                        }
+                    }
+                ]
+            }
+        ];
 
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        const audioBlob = pcmToWav(base64Audio, 24000);
-        const audio = new Audio(URL.createObjectURL(audioBlob));
-        audio.onended = () => setIsSpeaking(false);
-        await audio.play();
-      } else {
-         throw new Error("No audio returned");
-      }
-    } catch (e) { 
-      setIsSpeaking(false); 
-      // Fallback
-      if('speechSynthesis' in window) {
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = 'nl-NL';
-        utterance.onend = () => setIsSpeaking(false);
-        speechSynthesis.speak(utterance);
-      }
+        const sessionPromise = ai.live.connect({
+            model: "gemini-3.1-flash-live-preview",
+            callbacks: {
+                onopen: () => {
+                   addLog("Neurale Live Link actief. Luistert.", "success");
+                   source.connect(processor);
+                   processor.connect(audioCtx.destination);
+                   
+                   processor.onaudioprocess = (e) => {
+                       const inputData = e.inputBuffer.getChannelData(0);
+                       const pcm16 = new Int16Array(inputData.length);
+                       for (let i = 0; i < inputData.length; i++) {
+                           pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                       }
+                       const base64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
+                       sessionPromise.then(s => s.sendRealtimeInput([{
+                           mimeType: 'audio/pcm;rate=16000',
+                           data: base64
+                       }]));
+                   };
+                },
+                onmessage: async (message: any) => {
+                   // Handle Audio
+                   const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                   if (base64Audio) playBase64Audio(base64Audio);
+
+                   // Handle Text / transcription echo
+                   const textPart = message.serverContent?.modelTurn?.parts?.[0]?.text;
+                   if (textPart) {
+                      setLastCommand("Jarvis spreekt...");
+                   }
+
+                   // Handle Tools
+                   const functionCalls = message.toolCall?.functionCalls;
+                   if (functionCalls) {
+                       setIsThinking(true);
+                       sessionPromise.then(s => {
+                           const responses = functionCalls.map((call: any) => {
+                               if (call.name === 'update_interface') {
+                                   const args = call.args;
+                                   if (args.module) {
+                                      setActiveModule(args.module);
+                                      if (args.module === 'builder') setProjectBrief(args.data);
+                                      setUiData(args);
+                                   }
+                                   return { id: call.id, name: call.name, response: { result: "Interface succesvol geupdate." } };
+                               }
+                               if (call.name === 'manage_tasks') {
+                                   const args = call.args;
+                                   if (args.action === 'add') {
+                                       setTasks(prev => [...prev, { id: Math.random().toString(), title: args.title || "Nieuwe taak", dueDate: args.dueDate || null, remindAt: args.remindAt || null, completed: false, notified: false }]);
+                                   } else if (args.action === 'complete') {
+                                       setTasks(prev => prev.map(t => t.id === args.taskId ? { ...t, completed: true } : t));
+                                   }
+                                   return { id: call.id, name: call.name, response: { result: "Taakactie succesvol uitgevoerd." } };
+                               }
+                               return { id: call.id, name: call.name, response: { result: "Onbekende actie." } };
+                           });
+                           s.sendToolResponse({ functionResponses: responses });
+                           setIsThinking(false);
+                       });
+                   }
+
+                   if (message.serverContent?.interrupted) {
+                       clearPlaybackQueue();
+                       setIsSpeaking(false);
+                   }
+                },
+                onerror: (e: any) => {
+                   addLog("Live API error: " + e.message, "error");
+                   setIsListening(false);
+                },
+                onclose: () => {
+                   addLog("Live sessie gesloten.", "info");
+                   setIsListening(false);
+                }
+            },
+            config: {
+                systemInstruction: INITIAL_SYSTEM_PROMPT + `\nHuidige taken: ${JSON.stringify(tasksRef.current)}`,
+                tools: tools as any,
+                responseModalities: [Modality.AUDIO] as any,
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } } as any
+            }
+        });
+        
+        liveSessionRef.current = sessionPromise;
+    } catch(err: any) {
+        setIsListening(false);
+        addLog("Kon microfoon niet aansluiten.", "error");
     }
-  };
-
-  useEffect(() => { speakRef.current = speak; }, [speak]);
-
-  const pcmToWav = (base64Pcm: string, sampleRate: number) => {
-    const pcm = Uint8Array.from(atob(base64Pcm), c => c.charCodeAt(0)).buffer;
-    const wav = new Uint8Array(44 + pcm.byteLength);
-    const view = new DataView(wav.buffer);
-    const writeString = (offset: number, string: string) => {
-      for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
-    };
-    writeString(0, 'RIFF');
-    view.setUint32(4, 36 + pcm.byteLength, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, 'data');
-    view.setUint32(40, pcm.byteLength, true);
-    new Uint8Array(wav.buffer, 44).set(new Uint8Array(pcm));
-    return new Blob([wav], { type: 'audio/wav' });
-  };
-
-  // --- CONVERSATION LOGIC ---
-  const processConversation = async (input: string) => {
-    const lowInput = input.toLowerCase();
-    if (!lowInput.includes(TRIGGER_WORD)) return;
-    
-    if (lowInput.includes("halt") || lowInput.includes("stop")) {
-      setIsSpeaking(false);
-      speak("Begrepen. Ik sta in de wachtstand.");
-      return;
-    }
-
-    setIsThinking(true);
-    addLog(`Ingestie: "${input}"`, 'brain');
-
-    try {
-      const dynamicPrompt = `Je bent JARVIS AI 2, een hyper-geavanceerde voice-first desktop assistent.
-Huidige tijd (ISO): ${new Date().toISOString()}
-Huidig tijdstip (lokaal): ${new Date().toLocaleString('en-US')}
-
-Jouw primaire doel is COMMUNICATIE en VISUELE SYNCHRONISATIE.
-
-🧠 SMART EXPLANATION MODE (W-QUESTIONS):
-Als je vragen beantwoordt of een actie toelicht (behalve hele simpele commando's), neem je ALTIJD de volgende details in je gesproken tekst op als een vloeiend, natuurlijk verhaal:
-- What (Wat gebeurt er)
-- Why (Waarom is het relevant)
-- When (Wanneer gebeurde het)
-- Where (Waar, indien relevant)
-- Who (Wie is betrokken)
-Praat menselijk, kalm, intelligent en bondig (gebruik geen robotachtige lijstjes). Geef geen droge data, maar verklaar het kort en logisch. Je spreekt in de taal die de gebruiker spreekt.
-
-🖥️ AUTO GUI & UI ACTIONS (CRITICAL):
-Beslis ALTIJD welke UI mode het beste past. Je MOET exact één block tag injecteren in je antwoord zodat ik de interface aanpas. Dit doe je met JSON.
-
-Voorbeelden van acties aan het EINDE van je tekst:
-1. Nieuws/Weer/Algemeen Web: ###UI_ACTION:{"module":"smart-web", "type":"news", "data": {"headlines":["Kop 1", "Kop 2"], "categories":["Tech", "Wereld"], "summary":"Korte samenvatting."}}###
-2. Producten zoeken: ###UI_ACTION:{"module":"smart-web", "type":"products", "data": {"items":[{"name":"Product X","price":"$99","img":"url of placeholder"}]}}###
-3. Zoeken: ###UI_ACTION:{"module":"smart-web", "type":"search", "data": {"results":[{"title":"Gevonden Info", "desc":"Omschrijving"}]}}###
-4. Coderen/Bouwen ("Jarvis, bouw..."): ###UI_ACTION:{"module":"builder", "data": { "title": "App Naam", "structure": ["src/index.js", "src/App.tsx"], "features": ["Feature 1"], "status": "Building..." }}### (vertel me dat je dit NU aan het bouwen bent in je voice)
-5. Systeem/Scan/Controle ("Jarvis, scan mijn systeem"): ###UI_ACTION:{"module":"system", "data": { "processes": ["Network Scanner", "Security Check"], "status": "Optimal", "logs": ["Mem: 45%", "CPU: 12%"] }}###
-6. Takenlijst openen: ###UI_ACTION:{"module":"tasks", "data": null}###
-7. Niets / Standaard: ###UI_ACTION:{"module":"core", "data": null}###
-
-TAAKBEHEER ACTIES:
-Huidige taken: ${JSON.stringify(tasksRef.current)}
-Om een taak TO TE VOEGEN, voeg OOK toe: ###ADD_TASK:{"title":"naam","dueDate":"YYYY-MM-DDTHH:mm:ssZ","remindAt":"YYYY-MM-DDTHH:mm:ssZ"}###
-Om VOLTOOID te markeren: ###COMPLETE_TASK:{"taskId":"id"}###
-
-Geef EERST je uitleg in gewone praat, en plak de ### tags ONDERAAN. Gebruik geen markdown \`\`\` rond de tags.`;
-
-      let response = await callGemini(input, dynamicPrompt);
-      
-      // Parse UI Action
-      const uiMatch = response.match(/###UI_ACTION:([\s\S]*?)###/);
-      if (uiMatch) {
-          try {
-              const actionData = JSON.parse(uiMatch[1]);
-              if (actionData.module) {
-                 setActiveModule(actionData.module);
-                 if (actionData.module === 'builder') {
-                     // Backwards compat with old system
-                     setProjectBrief(actionData.data);
-                 }
-                 setUiData(actionData);
-              }
-          } catch(e) { console.error("UI parse error", e); }
-          response = response.replace(uiMatch[0], "");
-      }
-
-      // Parse Task Add
-      const addMatch = response.match(/###ADD_TASK:([\s\S]*?)###/);
-      if (addMatch) {
-          try {
-              const taskData = JSON.parse(addMatch[1]);
-              const newT = { id: Math.random().toString(36).substring(7), ...taskData, completed: false, notified: false };
-              setTasks(prev => [...prev, newT]);
-              addLog("Taak toegevoegd: " + taskData.title, "success");
-          } catch(e) { console.error("Task parse error", e); }
-          response = response.replace(addMatch[0], "");
-      }
-      
-      // Parse Task Complete
-      const compMatch = response.match(/###COMPLETE_TASK:([\s\S]*?)###/);
-      if (compMatch) {
-          try {
-              const taskData = JSON.parse(compMatch[1]);
-              setTasks(prev => prev.map(t => t.id === taskData.taskId ? { ...t, completed: true } : t));
-              addLog("Taak voltooid", "success");
-          } catch(e) {}
-          response = response.replace(compMatch[0], "");
-      }
-      
-      // Clean text for speaking
-      response = response.replace(/###[\s\S]*?###/g, "").trim();
-
-      setChatHistory(prev => [...prev, 
-        { role: "user", parts: [{ text: input }] },
-        { role: "model", parts: [{ text: response }] }
-      ].slice(-6));
-      
-      speak(response);
-      
-    } catch (error) {
-      addLog("Interne communicatiefout.", "error");
-    } finally {
-      setIsThinking(false);
-      setLastCommand("");
-    }
-  };
-
-  // --- SPEECH RECOGNITION ---
-  const startListening = useCallback(() => {
-    if (!('webkitSpeechRecognition' in window)) return;
-    const recognition = new (window as any).webkitSpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'nl-NL';
-
-    recognition.onresult = (event: any) => {
-      let interim = '';
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          const final = event.results[i][0].transcript.trim();
-          setLastCommand(final);
-          processConversation(final);
-        } else {
-          interim += event.results[i][0].transcript;
-        }
-      }
-      setLastCommand(interim);
-    };
-    recognition.onstart = () => setIsListening(true);
-    recognition.onend = () => isListening && recognition.start();
-    recognition.onerror = () => setIsListening(false);
-    recognitionRef.current = recognition;
-    recognition.start();
-  }, [isListening]);
+  }, []);
 
   // --- LIQUID ORB VISUALIZER ---
   useEffect(() => {
@@ -559,7 +553,7 @@ Geef EERST je uitleg in gewone praat, en plak de ### tags ONDERAAN. Gebruik geen
                       <p className="text-[10px] uppercase font-bold text-[var(--color-accent-purple)] mb-4">Systeemtijd</p>
                       <p className="text-5xl font-mono tracking-tighter">{dashboardData.time}</p>
                    </div>
-                   <button onClick={() => processConversation("scan mijn systeem")} className="w-full brief-card flex flex-col items-center gap-4 hover:bg-white/10 transition-all group cursor-pointer" style={{ borderLeftColor: 'var(--color-accent-green)' }}>
+                   <button onClick={() => submitTextCommand("scan mijn systeem")} className="w-full brief-card flex flex-col items-center gap-4 hover:bg-white/10 transition-all group cursor-pointer" style={{ borderLeftColor: 'var(--color-accent-green)' }}>
                       <div className="flex items-center gap-3">
                          <HeartPulse className="text-[var(--color-accent-green)] w-6 h-6 group-hover:scale-110 transition-all" />
                          <span className="text-xl italic">✨ Diagnose</span>
@@ -855,7 +849,7 @@ Geef EERST je uitleg in gewone praat, en plak de ### tags ONDERAAN. Gebruik geen
                   type="text" 
                   value={lastCommand}
                   onChange={(e) => setLastCommand(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && processConversation(lastCommand)}
+                  onKeyDown={(e) => e.key === 'Enter' && submitTextCommand(lastCommand)}
                   placeholder={`Zeg "${TRIGGER_WORD}, scan mijn systeem" of plan iets...`}
                   className="w-full bg-transparent border-none focus:outline-none focus:ring-0 text-xl font-light text-white placeholder-gray-800"
                 />
@@ -868,7 +862,7 @@ Geef EERST je uitleg in gewone praat, en plak de ### tags ONDERAAN. Gebruik geen
                 </button>
                 <div className="h-10 w-px bg-white/10"></div>
                 <button 
-                  onClick={() => processConversation(lastCommand)}
+                  onClick={() => submitTextCommand(lastCommand)}
                   className="px-10 py-4 bg-white text-black text-[11px] font-black uppercase tracking-[0.2em] rounded-2xl hover:bg-blue-500 hover:text-white transition-all transform active:scale-95 shadow-xl cursor-pointer"
                 >
                   ✨ Execute
