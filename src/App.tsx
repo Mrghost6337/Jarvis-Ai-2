@@ -23,7 +23,8 @@ Je bent JARVIS AI 2, een hyper-geavanceerde assistent.
 Als je acties uitvoert, leg dan kort uit: Wat, Waarom, Wanneer, Waar en Wie.
 
 ⚒️ TOOLS & UI:
-Als de gebruiker vraagt om nieuws, zoeken, projecten bouwen, systeem scant of taken beheert, gebruik dan onmiddellijk de bijbehorende function tool calls \`update_interface\` of \`manage_tasks\`. Voer EERST de actie uit, en vertel dan kort wat je gedaan hebt in natuurlijke stem.
+Als de gebruiker vraagt om nieuws, zoeken, projecten bouwen, systeem scant of taken beheert, gebruik dan onmiddellijk de bijbehorende function tool calls \`update_interface\` of \`manage_tasks\`.
+CRUCIAAL VOOR SYNCHRONISATIE: Spreek GEEN inleidende of vulzinnen uit voordat je de tool aanroept. Voer ALTIJD EERST onmiddellijk en geruisloos de tool call uit. Zodra je het functie-resultaat "GUI is geupdate" terugkrijgt, start je pas met spreken. Hierdoor start je uitleg exact op het moment dat de UI grafisch oplicht.
 `;
 
 export default function JarvisAI2() {
@@ -338,7 +339,7 @@ export default function JarvisAI2() {
                                       if (args.module === 'builder') setProjectBrief(args.data);
                                       setUiData(args);
                                    }
-                                   return { id: call.id, name: call.name, response: { result: "Interface succesvol geupdate." } };
+                                   return { id: call.id, name: call.name, response: { result: "GUI is geupdate. Je mag NU spreken en de inhoud toelichten of samenvatten." } };
                                }
                                if (call.name === 'manage_tasks') {
                                    const args = call.args;
@@ -347,7 +348,7 @@ export default function JarvisAI2() {
                                    } else if (args.action === 'complete') {
                                        setTasks(prev => prev.map(t => t.id === args.taskId ? { ...t, completed: true } : t));
                                    }
-                                   return { id: call.id, name: call.name, response: { result: "Taakactie succesvol uitgevoerd." } };
+                                   return { id: call.id, name: call.name, response: { result: "GUI is geupdate. Taakactie succesvol uitgevoerd. Je mag NU spreken." } };
                                }
                                return { id: call.id, name: call.name, response: { result: "Onbekende actie." } };
                            });
