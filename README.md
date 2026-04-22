@@ -46,7 +46,7 @@ Get Jarvis AI 2 running on your local machine with these simple steps:
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-username/jarvis-ai-2.git
+   git clone https://github.com/Mrghost6337/Jarvis-Ai-2.git
    cd jarvis-ai-2
    ```
 
